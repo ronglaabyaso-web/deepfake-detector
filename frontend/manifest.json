@@ -1,0 +1,26 @@
+{
+  "name": "DEEPFAKE DETECTOR",
+  "short_name": "Deepfake",
+  "description": "ตรวจคลิป ลิงก์ และข้อความน่าสงสัยว่าเป็นของปลอมหรือมิจฉาชีพ ฟรี",
+  "lang": "th",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0f1c",
+  "theme_color": "#0a0f1c",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# ไลบรารีตรวจวิดีโอ (ตัวหนัก) — ติดตั้งเพิ่มเมื่ออยากได้ฟีเจอร์ตรวจคลิปวิดีโอ
+# pip install -r requirements-video.txt
+torch>=2.2
+transformers>=4.40
+opencv-python-headless>=4.9
+yt-dlp>=2024.4.9
+pillow>=10.0
+numpy>=1.26
