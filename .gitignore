@@ -24,3 +24,6 @@ backend/tmp_videos/
 # OS
 .DS_Store
 Thumbs.db
+
+# Windows shortcut
+*.lnk
