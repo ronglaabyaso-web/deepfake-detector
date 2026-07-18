@@ -4,7 +4,7 @@ services:
     name: deepfake-detector
     runtime: python
     plan: free
-    buildCommand: pip install -r backend/requirements.txt
+    buildCommand: pip install -r backend/requirements-deploy.txt
     startCommand: cd backend && python run.py
     healthCheckPath: /api/health
     envVars:
@@ -14,3 +14,8 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-flash-lite-latest
+      # ตรวจคลิปวิดีโอผ่าน Hugging Face Inference API (ไม่ต้องใช้ torch)
+      - key: DEEPFAKE_HF_TOKEN
+        sync: false
+      - key: DEEPFAKE_MODEL_ID
+        value: prithivMLmods/deepfake-detector-model-v1

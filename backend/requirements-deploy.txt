@@ -1,0 +1,12 @@
+# ไลบรารีสำหรับ deploy บนเซิร์ฟเวอร์แรมน้อย (เช่น Render ฟรี 512MB)
+# = ตัวหลัก + ชุดดาวน์โหลด/ตัดเฟรม/ตรวจหน้า (เบา ไม่มี torch)
+# การให้คะแนน deepfake ใช้ Hugging Face Inference API (ตั้ง env DEEPFAKE_HF_TOKEN)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-dotenv>=1.0
+google-genai>=1.0
+httpx>=0.27
+opencv-python-headless>=4.9,<5
+yt-dlp>=2024.4.9
+pillow>=10.0
+numpy>=1.26,<2.3

@@ -95,7 +95,7 @@ def health():
         "status": "ok",
         "ai_provider": client.provider,          # gemini/claude/ollama/none
         "video_model_id": video_pipeline.MODEL_ID,
-        "video_ready": video_pipeline._check_deps(),
+        "video_ready": video_pipeline.video_ready(),
     }
 
 

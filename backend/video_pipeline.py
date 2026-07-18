@@ -3,20 +3,26 @@
 
 หลักการ (อิงงานวิจัย 2026: ไม่มีโมเดลเดี่ยวแม่นสุด ควรผสมหลายตัว + เน้นใบหน้า):
 1. Ensemble หลายโมเดล — env DEEPFAKE_MODEL_ID รับหลายตัวคั่นด้วย comma
-   โหลดทุกตัว (ตัวที่โหลดไม่ได้ให้ข้าม) ต่อเฟรมเฉลี่ยคะแนน "ความเป็นของปลอม" จากทุกโมเดล
+   เฉลี่ยคะแนน "ความเป็นของปลอม" จากทุกโมเดลต่อเฟรม (ตัวที่ใช้ไม่ได้ให้ข้าม)
 2. วิเคราะห์เฉพาะเฟรมที่เจอใบหน้า + ครอปหน้าแบบมีขอบ (FACE_MARGIN ~20%)
    ถ้าไม่เจอใบหน้าเลยทั้งคลิป → ตอบตรง ๆ ว่า "ไม่พบใบหน้า ประเมินไม่ได้" (ไม่เดามั่ว)
 3. รวมผลแบบค่าเฉลี่ย + timestamp ที่น่าสงสัย + degrade เมื่อ error + ส่ง models_used
 4. MODEL_ID (สตริงรวม) ให้ /api/health แสดงได้
 
-ต้องติดตั้ง requirements-video.txt ก่อน (torch, transformers, opencv, yt-dlp)
-ถ้ายังไม่ได้ติดตั้ง — analyze_video() คืน status "unavailable" พร้อมคำอธิบายไทย
+สองโหมดการให้คะแนน (เลือกอัตโนมัติ):
+- local  : ติดตั้ง torch+transformers → โหลดโมเดลรันในเครื่อง (แม่น/เป็นส่วนตัว แต่กินแรม)
+- remote : ตั้ง env DEEPFAKE_HF_TOKEN → เรียก Hugging Face Inference API แทน
+           (เบามาก รันบนเซิร์ฟเวอร์แรมน้อยได้ เช่น 512MB — ต้องมีแค่ opencv + yt-dlp)
+
+ทั้งสองโหมดต้องมี opencv (cv2) + yt-dlp สำหรับดาวน์โหลด/ตัดเฟรม/ตรวจหน้า
+ถ้าขาด — analyze_video() คืน status "unavailable" พร้อมคำอธิบายไทย
 
 ผลลัพธ์ analyze_video(url) มีคีย์: status, risk_percent, frames_analyzed,
 faces_found, suspicious_timestamps, error_th (+ models_used, disclaimer_th)
 """
 import os
 import tempfile
+import time
 
 # สตริงรวมของทุกโมเดล — ให้ /api/health แสดง
 MODEL_ID = os.environ.get(
@@ -26,6 +32,12 @@ MODEL_ID = os.environ.get(
 FACE_MARGIN = float(os.environ.get("FACE_MARGIN", "0.2"))
 MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "16"))
 MAX_VIDEO_SECONDS = int(os.environ.get("MAX_VIDEO_SECONDS", "180"))
+
+# โหมด remote (Hugging Face Inference API) — ตั้ง token ฝั่งเซิร์ฟเวอร์เท่านั้น
+HF_TOKEN = os.environ.get("DEEPFAKE_HF_TOKEN", "").strip()
+HF_ROUTER = "https://router.huggingface.co/hf-inference/models/"
+# remote เรียก API ทีละเฟรม จึงจำกัดจำนวนหน้าที่ส่งไปเพื่อความเร็ว/โควตา
+REMOTE_MAX_FACES = int(os.environ.get("REMOTE_MAX_FACES", "8"))
 
 DISCLAIMER_TH = (
     "ผลนี้เป็นเพียงสัญญาณเตือนให้ระวัง ไม่ใช่คำตัดสิน 100% — "
@@ -38,23 +50,53 @@ DISCLAIMER_TH = (
 FAKE_LABEL_HINTS = ("fake", "deepfake", "spoof", "synthetic", "generated", "manipulated", "ai")
 REAL_LABEL_HINTS = ("real", "authentic", "genuine", "live", "original", "human")
 
-_models = None            # list ของ (name, processor, model, fake_index)
-_deps_available = None    # None = ยังไม่เช็ก, True/False = เช็กแล้ว
+_models = None            # โหมด local: list ของ (name, processor, model, fake_index)
+_remote_models = None      # โหมด remote: list ของ model_id ที่ยังใช้งานได้
+_video_deps = None         # None = ยังไม่เช็ก, True/False = เช็กแล้ว (cv2 + yt_dlp)
+_local_ready = None        # torch + transformers ติดตั้งไหม
 
 
-def _check_deps() -> bool:
-    """เช็กว่าไลบรารีตัวหนักติดตั้งครบไหม (เช็กครั้งเดียว)"""
-    global _deps_available
-    if _deps_available is None:
+def _has_video_deps() -> bool:
+    """เช็กไลบรารีดาวน์โหลด/ตัดเฟรม/ตรวจหน้า (cv2 + yt_dlp) — เช็กครั้งเดียว"""
+    global _video_deps
+    if _video_deps is None:
         try:
-            import cv2            # noqa: F401
+            import cv2       # noqa: F401
+            import yt_dlp    # noqa: F401
+            from PIL import Image  # noqa: F401
+            _video_deps = True
+        except ImportError:
+            _video_deps = False
+    return _video_deps
+
+
+def _has_local_models() -> bool:
+    """เช็กว่ารันโมเดลในเครื่องได้ไหม (torch + transformers)"""
+    global _local_ready
+    if _local_ready is None:
+        try:
             import torch          # noqa: F401
             import transformers   # noqa: F401
-            import yt_dlp         # noqa: F401
-            _deps_available = True
+            _local_ready = True
         except ImportError:
-            _deps_available = False
-    return _deps_available
+            _local_ready = False
+    return _local_ready
+
+
+def _mode() -> str | None:
+    """เลือกโหมดให้คะแนน: 'local' (torch) > 'remote' (HF API) > None (ทำไม่ได้)"""
+    if not _has_video_deps():
+        return None
+    if _has_local_models():
+        return "local"
+    if HF_TOKEN:
+        return "remote"
+    return None
+
+
+def video_ready() -> bool:
+    """ตรวจวิดีโอได้ไหม (ให้ /api/health ใช้) — ต้องมี deps + ช่องทางให้คะแนน"""
+    return _mode() is not None
 
 
 def _find_fake_index(id2label: dict) -> int | None:
@@ -71,6 +113,28 @@ def _find_fake_index(id2label: dict) -> int | None:
     return None
 
 
+def _fake_score_from_labels(results) -> float | None:
+    """แปลงผล [{'label':..,'score':..}, ...] เป็นคะแนน "ความเป็นของปลอม" 0-1"""
+    if not isinstance(results, list) or not results:
+        return None
+    fake, real = None, None
+    for item in results:
+        lbl = str(item.get("label", "")).lower()
+        sc = float(item.get("score", 0))
+        if any(h in lbl for h in FAKE_LABEL_HINTS):
+            fake = sc
+        elif any(h in lbl for h in REAL_LABEL_HINTS):
+            real = sc
+    if fake is not None:
+        return fake
+    if real is not None:  # มีแต่ label real → ของปลอม = ส่วนที่เหลือ
+        return 1.0 - real
+    return None
+
+
+# ---------------------------------------------------------------------------
+# โหมด local (torch)
+# ---------------------------------------------------------------------------
 def _load_models():
     """โหลดทุกโมเดลจาก DEEPFAKE_MODEL_ID (คั่น comma) — ตัวที่โหลดไม่ได้ให้ข้าม"""
     global _models
@@ -93,20 +157,106 @@ def _load_models():
     return _models
 
 
+def _score_face_local(face_bgr, models) -> float:
+    """ให้คะแนน "ความเป็นของปลอม" 0-1 โดยเฉลี่ยจากทุกโมเดลในเครื่อง (ensemble)"""
+    import cv2
+    import torch
+    from PIL import Image
+    rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    scores = []
+    for _name, processor, model, fake_idx in models:
+        try:
+            inputs = processor(images=pil, return_tensors="pt")
+            with torch.no_grad():
+                logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)[0]
+            scores.append(float(probs[fake_idx]))
+        except Exception:
+            continue  # โมเดลตัวนี้พลาดกับเฟรมนี้ — ใช้ตัวที่เหลือ
+    if not scores:
+        raise RuntimeError("all models failed on frame")
+    return sum(scores) / len(scores)
+
+
+# ---------------------------------------------------------------------------
+# โหมด remote (Hugging Face Inference API) — ไม่ต้องมี torch
+# ---------------------------------------------------------------------------
+def _init_remote_models():
+    """คืน list ของ model_id ทั้งหมดจาก DEEPFAKE_MODEL_ID (ตัวที่ใช้ไม่ได้จะถูกตัดตอนเรียกจริง)"""
+    global _remote_models
+    if _remote_models is None:
+        _remote_models = [m.strip() for m in MODEL_ID.split(",") if m.strip()]
+    return _remote_models
+
+
+def _encode_jpeg(face_bgr) -> bytes:
+    import cv2
+    ok, buf = cv2.imencode(".jpg", face_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise RuntimeError("jpeg encode failed")
+    return buf.tobytes()
+
+
+def _score_face_remote(face_bgr, model_ids) -> float:
+    """ให้คะแนน 0-1 โดยเฉลี่ยจากทุกโมเดลผ่าน HF Inference API (ตัดโมเดลที่ตายทิ้ง)"""
+    import httpx
+    jpg = _encode_jpeg(face_bgr)
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "image/jpeg"}
+    scores = []
+    dead = []
+    for model_id in model_ids:
+        score = None
+        for attempt in range(3):
+            try:
+                r = httpx.post(HF_ROUTER + model_id, headers=headers, content=jpg, timeout=45)
+            except Exception:
+                break  # เน็ตพลาด — ข้ามโมเดลนี้เฟรมนี้
+            if r.status_code == 503:      # โมเดลกำลัง warm up — รอแล้วลองใหม่
+                time.sleep(6)
+                continue
+            if r.status_code in (404, 410, 400):
+                dead.append(model_id)     # โมเดลถูกเลิกซัพพอร์ต — เลิกเรียกถาวร
+                break
+            if r.status_code == 200:
+                score = _fake_score_from_labels(r.json())
+            break
+        if score is not None:
+            scores.append(score)
+    # ตัดโมเดลที่ตายออกจากรายการ (ไม่เรียกซ้ำเฟรมต่อไป)
+    if dead:
+        model_ids[:] = [m for m in model_ids if m not in dead]
+    if not scores:
+        raise RuntimeError("all remote models failed on frame")
+    return sum(scores) / len(scores)
+
+
+# ---------------------------------------------------------------------------
+# ดาวน์โหลด / ตัดเฟรม / ตรวจหน้า (ใช้ร่วมกันทั้งสองโหมด)
+# ---------------------------------------------------------------------------
 def _download_video(url: str, workdir: str) -> str:
-    """ดาวน์โหลดวิดีโอด้วย yt-dlp คืน path ไฟล์ (raise เมื่อพลาด)"""
+    """ดาวน์โหลดวิดีโอด้วย yt-dlp คืน path ไฟล์ (raise เมื่อพลาด)
+
+    เลือกฟอร์แมตไฟล์เดียว (progressive) ก่อน เพื่อไม่ต้องพึ่ง ffmpeg บนเซิร์ฟเวอร์เล็ก
+    """
     import yt_dlp
     out_tmpl = os.path.join(workdir, "video.%(ext)s")
+
+    def _too_long(info, *, incomplete=False):
+        dur = info.get("duration")
+        if dur is not None and dur > MAX_VIDEO_SECONDS:
+            return f"คลิปยาวเกิน {MAX_VIDEO_SECONDS} วินาที"
+        return None  # None = ผ่าน (รวมกรณีไม่รู้ความยาว)
+
     opts = {
         "outtmpl": out_tmpl,
-        "format": "best[height<=480]/bestvideo[height<=480]+bestaudio/best",
+        "format": "best[ext=mp4][height<=480]/best[ext=mp4]/mp4/best",
         "max_filesize": 200 * 1024 * 1024,
-        "match_filter": yt_dlp.utils.match_filter_func(
-            f"duration <= {MAX_VIDEO_SECONDS} | duration = None"
-        ),
+        "match_filter": _too_long,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
@@ -163,28 +313,6 @@ def _detect_face_crop(frame_bgr):
     return frame_bgr[y0:y1, x0:x1]
 
 
-def _score_face(face_bgr, models) -> float:
-    """ให้คะแนน "ความเป็นของปลอม" 0-1 โดยเฉลี่ยจากทุกโมเดล (ensemble)"""
-    import cv2
-    import torch
-    from PIL import Image
-    rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb)
-    scores = []
-    for _name, processor, model, fake_idx in models:
-        try:
-            inputs = processor(images=pil, return_tensors="pt")
-            with torch.no_grad():
-                logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1)[0]
-            scores.append(float(probs[fake_idx]))
-        except Exception:
-            continue  # โมเดลตัวนี้พลาดกับเฟรมนี้ — ใช้ตัวที่เหลือ
-    if not scores:
-        raise RuntimeError("all models failed on frame")
-    return sum(scores) / len(scores)
-
-
 def analyze_video(url: str) -> dict:
     """วิเคราะห์วิดีโอจากลิงก์ คืน dict ตามสัญญาเดิม + degrade อย่างนุ่มนวลเมื่อ error
 
@@ -202,24 +330,36 @@ def analyze_video(url: str) -> dict:
         "disclaimer_th": DISCLAIMER_TH,
     }
 
-    if not _check_deps():
+    mode = _mode()
+    if mode is None:
         base["status"] = "unavailable"
-        base["error_th"] = (
-            "เครื่องนี้ยังไม่ได้ติดตั้งชุดตรวจคลิปวิดีโอ จึงตรวจคลิปไม่ได้ตอนนี้ "
-            "แต่ยังตรวจข้อความและถามผู้ช่วยได้ตามปกติ — "
-            "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
-        )
+        if not _has_video_deps():
+            base["error_th"] = (
+                "เครื่องนี้ยังไม่ได้ติดตั้งชุดตรวจคลิปวิดีโอ จึงตรวจคลิปไม่ได้ตอนนี้ "
+                "แต่ยังตรวจข้อความและถามผู้ช่วยได้ตามปกติ — "
+                "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
+            )
+        else:
+            base["error_th"] = (
+                "ยังไม่ได้ตั้งค่าตัวตรวจคลิป จึงตรวจคลิปไม่ได้ตอนนี้ "
+                "แต่ยังตรวจข้อความและถามผู้ช่วยได้ตามปกติ"
+            )
         return base
 
-    models = _load_models()
-    base["models_used"] = [name for name, *_ in models]
-    if not models:
-        base["status"] = "unavailable"
-        base["error_th"] = (
-            "โหลดตัวตรวจคลิปไม่สำเร็จ (อาจเป็นที่อินเทอร์เน็ต) ลองใหม่อีกครั้งภายหลัง "
-            "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
-        )
-        return base
+    # เตรียมรายการโมเดลตามโหมด
+    if mode == "local":
+        models = _load_models()
+        base["models_used"] = [name for name, *_ in models]
+        if not models:
+            base["status"] = "unavailable"
+            base["error_th"] = (
+                "โหลดตัวตรวจคลิปไม่สำเร็จ (อาจเป็นที่อินเทอร์เน็ต) ลองใหม่อีกครั้งภายหลัง "
+                "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
+            )
+            return base
+    else:  # remote
+        models = _init_remote_models()
+        base["models_used"] = list(models)
 
     with tempfile.TemporaryDirectory(prefix="dfvideo_") as workdir:
         # 1) ดาวน์โหลด
@@ -227,8 +367,9 @@ def analyze_video(url: str) -> dict:
             video_path = _download_video(url, workdir)
         except Exception:
             base["error_th"] = (
-                "ดาวน์โหลดคลิปจากลิงก์นี้ไม่ได้ ลองตรวจดูว่าลิงก์ถูกต้อง เปิดดูได้จริง "
-                "และคลิปไม่ยาวเกิน 3 นาที แล้วลองใหม่อีกครั้ง"
+                "ดาวน์โหลดคลิปจากลิงก์นี้ไม่ได้ อาจเป็นเพราะแพลตฟอร์มบล็อกการโหลด "
+                "หรือคลิปเป็นส่วนตัว/ยาวเกิน 3 นาที — ลองใช้ลิงก์คลิปสาธารณะอื่น "
+                "หรือใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
             )
             return base
 
@@ -241,7 +382,7 @@ def analyze_video(url: str) -> dict:
             base["error_th"] = "อ่านภาพจากคลิปนี้ไม่ได้ คลิปอาจเสียหรือเป็นรูปแบบที่ไม่รองรับ"
             return base
 
-        # 3) ตรวจหน้า + 4) ให้คะแนน ensemble เฉพาะเฟรมที่เจอใบหน้า
+        # 3) ตรวจหน้า + 4) ให้คะแนนเฉพาะเฟรมที่เจอใบหน้า
         per_frame = []  # (timestamp, score)
         faces_found = 0
         for ts, frame in frames:
@@ -249,8 +390,14 @@ def analyze_video(url: str) -> dict:
             if face is None or face.size == 0:
                 continue
             faces_found += 1
+            # โหมด remote จำกัดจำนวนหน้าที่ส่งไป API เพื่อความเร็ว/โควตา
+            if mode == "remote" and len(per_frame) >= REMOTE_MAX_FACES:
+                continue
             try:
-                per_frame.append((ts, _score_face(face, models)))
+                if mode == "local":
+                    per_frame.append((ts, _score_face_local(face, models)))
+                else:
+                    per_frame.append((ts, _score_face_remote(face, models)))
             except Exception:
                 continue  # เฟรมนี้ประเมินพลาด — ข้าม (degrade นุ่มนวล)
 
@@ -281,4 +428,7 @@ def analyze_video(url: str) -> dict:
         base["suspicious_timestamps"] = [
             round(ts, 1) for ts, s in per_frame if s > 0.6
         ]
+        # โหมด remote: models_used = เฉพาะตัวที่ยังไม่ตาย
+        if mode == "remote":
+            base["models_used"] = list(models)
         return base
