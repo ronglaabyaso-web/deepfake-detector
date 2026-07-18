@@ -22,8 +22,10 @@ from dotenv import load_dotenv
 load_dotenv()  # ต้องมาก่อน import โมดูลที่อ่าน env ตอน import
 
 import asyncio
+import shutil
+import tempfile
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -138,6 +140,38 @@ async def analyze_video(body: VideoIn):
     # งานหนัก — รันใน thread แยก ไม่บล็อกผู้ใช้คนอื่น
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(_video_executor, video_pipeline.analyze_video, url)
+
+
+# ขนาดไฟล์อัปโหลดสูงสุด (100MB) — กันไฟล์ใหญ่ทำเซิร์ฟเวอร์เล็กล่ม
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+
+@app.post("/api/analyze-video-file")
+async def analyze_video_file(file: UploadFile = File(...)):
+    """วิเคราะห์คลิปจากไฟล์ที่อัปโหลด (เลี่ยงการบล็อกดาวน์โหลดของ TikTok/YouTube)"""
+    suffix = os.path.splitext(file.filename or "")[1][:8] or ".mp4"
+    tmp = tempfile.NamedTemporaryFile(prefix="dfupload_", suffix=suffix, delete=False)
+    size = 0
+    try:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                return JSONResponse(status_code=400, content={
+                    "error_th": "ไฟล์คลิปใหญ่เกินไป (เกิน 100 MB) ลองตัดให้สั้นลงหรือลดความละเอียดก่อนนะคะ"})
+            tmp.write(chunk)
+        tmp.close()
+        if size == 0:
+            return JSONResponse(status_code=400, content={"error_th": "ไม่พบไฟล์คลิป ลองเลือกไฟล์ใหม่นะคะ"})
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(_video_executor, video_pipeline.analyze_video_file, tmp.name)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 @app.post("/api/chat")

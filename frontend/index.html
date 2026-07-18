@@ -567,15 +567,29 @@ registerPage("check", (root) => {
   const tabText = el("button", { text: "✉️ ข้อความ / SMS" });
   root.appendChild(el("div", { class: "tabs" }, tabVideo, tabText));
 
-  /* ----- ส่วนคลิป/ลิงก์ (สร้างครั้งเดียว) ----- */
+  /* ----- ส่วนคลิป/ลิงก์ + อัปโหลดไฟล์ (สร้างครั้งเดียว) ----- */
   const videoSection = el("div", null);
   const inUrl = el("input", { type: "url", placeholder: "วางลิงก์คลิปที่นี่ เช่น จากยูทูบ เฟซบุ๊ก ติ๊กต็อก" });
-  const videoBtn = el("button", { class: "btn", style: "margin-top:10px", text: "ตรวจคลิปนี้" });
+  const videoBtn = el("button", { class: "btn", style: "margin-top:10px", text: "ตรวจคลิปจากลิงก์" });
   const videoResult = el("div", { id: "videoResult", style: "margin-top:14px" }); // container ผลลัพธ์ — ไม่มี input ข้างใน
   videoSection.appendChild(el("div", { class: "card" },
-    el("div", { class: "field" }, el("label", { text: "ลิงก์คลิปที่สงสัย" }), inUrl),
+    el("div", { class: "field" }, el("label", { text: "วางลิงก์คลิปที่สงสัย" }), inUrl),
     videoBtn,
     el("p", { class: "muted", style: "margin-top:10px", text: "การตรวจคลิปใช้เวลาสักครู่ (อาจถึง 2-3 นาที) ใจเย็น ๆ นะคะ" })));
+
+  videoSection.appendChild(el("div", { class: "hr-text", text: "หรือ (แนะนำ)" }));
+
+  // อัปโหลดไฟล์ — แน่นอนกว่าเมื่อลิงก์จากบางแอปโหลดไม่ได้
+  const inFile = el("input", { type: "file", accept: "video/*", style: "display:none" });
+  const pickBtn = el("button", { class: "btn secondary", text: "📁 เลือกไฟล์คลิปจากเครื่อง" });
+  const fileName = el("p", { class: "muted", style: "margin-top:10px", text: "ยังไม่ได้เลือกไฟล์" });
+  const uploadBtn = el("button", { class: "btn", style: "margin-top:10px", text: "ตรวจคลิปที่เลือก" });
+  uploadBtn.disabled = true;
+  videoSection.appendChild(el("div", { class: "card" },
+    el("div", { class: "field" }, el("label", { text: "อัปโหลดไฟล์คลิป" }), inFile, pickBtn, fileName),
+    uploadBtn,
+    el("p", { class: "muted", style: "margin-top:10px", text: "ถ้าวางลิงก์แล้วโหลดไม่ได้ (เช่น TikTok/YouTube) ให้เซฟคลิปลงเครื่องก่อนแล้วเลือกไฟล์ตรงนี้ — ได้ผลชัวร์กว่า" })));
+
   videoSection.appendChild(videoResult);
 
   /* ----- ส่วนข้อความ/SMS (สร้างครั้งเดียว) ----- */
@@ -657,7 +671,36 @@ registerPage("check", (root) => {
     }
   });
 
-  /* ----- ตรวจคลิป ----- */
+  /* ----- แสดงผลตรวจคลิป (ใช้ร่วมกันทั้งลิงก์และไฟล์) ----- */
+  function showVideoResult(d) {
+    videoResult.textContent = "";
+    if (d.status === "ok") {
+      const extras = [];
+      extras.push(el("p", { class: "muted", style: "margin-top:10px", text: `ดูภาพจากคลิปทั้งหมด ${d.frames_analyzed} ช่วง พบใบหน้า ${d.faces_found} ช่วง` }));
+      if (d.suspicious_timestamps && d.suspicious_timestamps.length) {
+        const times = d.suspicious_timestamps.slice(0, 8).map((t) => {
+          const m = Math.floor(t / 60), s = Math.round(t % 60);
+          return `${m}:${String(s).padStart(2, "0")}`;
+        }).join(", ");
+        extras.push(el("p", { class: "muted", style: "margin-top:6px", text: `ช่วงเวลาที่น่าสงสัย (นาที:วินาที): ${times}` }));
+      }
+      renderRisk(videoResult, d.risk_percent, null,
+        d.risk_percent >= 60 ? "คลิปนี้มีสัญญาณของการปลอมแปลงค่อนข้างมาก" :
+        d.risk_percent >= 30 ? "คลิปนี้มีบางจุดน่าสงสัย ควรตรวจสอบเพิ่ม" :
+        "ยังไม่พบสัญญาณการปลอมแปลงที่ชัดเจน",
+        d.risk_percent >= 30 ? "อย่าเพิ่งเชื่อหรือโอนเงินตามคลิปนี้ ตรวจสอบกับเจ้าตัวหรือแหล่งข่าวจริงก่อน" :
+        "ถึงคลิปจะดูปกติ ถ้ามีการขอเงินหรือขอรหัส ให้ยึดกฎทอง 3 ข้อเสมอ",
+        d.disclaimer_th, extras);
+    } else {
+      // no_face / unavailable / error → แสดงคำอธิบายไทยตรง ๆ
+      videoResult.appendChild(el("div", { class: "card" },
+        el("h3", { text: d.status === "no_face" ? "😶 ไม่พบใบหน้าในคลิป" : "ตรวจคลิปไม่สำเร็จ" }),
+        el("p", { style: "margin-top:8px;line-height:1.6", text: d.error_th || "เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะคะ" }),
+        disclaimerBox(d.disclaimer_th)));
+    }
+  }
+
+  /* ----- ตรวจคลิปจากลิงก์ ----- */
   videoBtn.addEventListener("click", async () => {
     const url = inUrl.value.trim();
     if (!url) {
@@ -670,39 +713,43 @@ registerPage("check", (root) => {
     videoResult.textContent = "";
     videoResult.appendChild(spinnerBox("กำลังดูคลิปให้อยู่ค่ะ อาจใช้เวลา 2-3 นาที อย่าเพิ่งปิดหน้านี้นะคะ"));
     try {
-      const d = await post("/api/analyze-video", { url });
-      videoResult.textContent = "";
-      if (d.status === "ok") {
-        const extras = [];
-        extras.push(el("p", { class: "muted", style: "margin-top:10px", text: `ดูภาพจากคลิปทั้งหมด ${d.frames_analyzed} ช่วง พบใบหน้า ${d.faces_found} ช่วง` }));
-        if (d.suspicious_timestamps && d.suspicious_timestamps.length) {
-          const times = d.suspicious_timestamps.slice(0, 8).map((t) => {
-            const m = Math.floor(t / 60), s = Math.round(t % 60);
-            return `${m}:${String(s).padStart(2, "0")}`;
-          }).join(", ");
-          extras.push(el("p", { class: "muted", style: "margin-top:6px", text: `ช่วงเวลาที่น่าสงสัย (นาที:วินาที): ${times}` }));
-        }
-        renderRisk(videoResult, d.risk_percent, null,
-          d.risk_percent >= 60 ? "คลิปนี้มีสัญญาณของการปลอมแปลงค่อนข้างมาก" :
-          d.risk_percent >= 30 ? "คลิปนี้มีบางจุดน่าสงสัย ควรตรวจสอบเพิ่ม" :
-          "ยังไม่พบสัญญาณการปลอมแปลงที่ชัดเจน",
-          d.risk_percent >= 30 ? "อย่าเพิ่งเชื่อหรือโอนเงินตามคลิปนี้ ตรวจสอบกับเจ้าตัวหรือแหล่งข่าวจริงก่อน" :
-          "ถึงคลิปจะดูปกติ ถ้ามีการขอเงินหรือขอรหัส ให้ยึดกฎทอง 3 ข้อเสมอ",
-          d.disclaimer_th, extras);
-      } else {
-        // no_face / unavailable / error → แสดงคำอธิบายไทยตรง ๆ
-        const box = el("div", { class: "card" },
-          el("h3", { text: d.status === "no_face" ? "😶 ไม่พบใบหน้าในคลิป" : "ตรวจคลิปไม่สำเร็จ" }),
-          el("p", { style: "margin-top:8px;line-height:1.6", text: d.error_th || "เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะคะ" }),
-          disclaimerBox(d.disclaimer_th));
-        videoResult.appendChild(box);
-      }
+      showVideoResult(await post("/api/analyze-video", { url }));
     } catch (e) {
       videoResult.textContent = "";
       videoResult.appendChild(errBox(e.message));
     } finally {
       videoBtn.disabled = false;
-      videoBtn.textContent = "ตรวจคลิปนี้";
+      videoBtn.textContent = "ตรวจคลิปจากลิงก์";
+    }
+  });
+
+  /* ----- ตรวจคลิปจากไฟล์อัปโหลด ----- */
+  pickBtn.addEventListener("click", () => inFile.click());
+  inFile.addEventListener("change", () => {
+    const f = inFile.files && inFile.files[0];
+    fileName.textContent = f ? `เลือกแล้ว: ${f.name}` : "ยังไม่ได้เลือกไฟล์";
+    uploadBtn.disabled = !f;
+  });
+  uploadBtn.addEventListener("click", async () => {
+    const f = inFile.files && inFile.files[0];
+    if (!f) return;
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = "กำลังตรวจ...";
+    videoResult.textContent = "";
+    videoResult.appendChild(spinnerBox("กำลังอัปโหลดและดูคลิปให้อยู่ค่ะ อาจใช้เวลา 2-3 นาที อย่าเพิ่งปิดหน้านี้นะคะ"));
+    try {
+      const form = new FormData();
+      form.append("file", f);
+      const res = await fetch(apiBase() + "/api/analyze-video-file", { method: "POST", body: form });
+      const d = await res.json();
+      if (!res.ok) throw new Error((d && d.error_th) || "อัปโหลดไม่สำเร็จ ลองใหม่นะคะ");
+      showVideoResult(d);
+    } catch (e) {
+      videoResult.textContent = "";
+      videoResult.appendChild(errBox(e.message));
+    } finally {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = "ตรวจคลิปที่เลือก";
     }
   });
 });

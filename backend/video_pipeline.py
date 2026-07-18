@@ -313,13 +313,8 @@ def _detect_face_crop(frame_bgr):
     return frame_bgr[y0:y1, x0:x1]
 
 
-def analyze_video(url: str) -> dict:
-    """วิเคราะห์วิดีโอจากลิงก์ คืน dict ตามสัญญาเดิม + degrade อย่างนุ่มนวลเมื่อ error
-
-    คีย์: status, risk_percent, frames_analyzed, faces_found,
-          suspicious_timestamps, error_th, models_used, disclaimer_th
-    """
-    base = {
+def _new_base() -> dict:
+    return {
         "status": "error",
         "risk_percent": None,
         "frames_analyzed": 0,
@@ -330,6 +325,9 @@ def analyze_video(url: str) -> dict:
         "disclaimer_th": DISCLAIMER_TH,
     }
 
+
+def _prepare(base: dict):
+    """เลือกโหมด + เตรียมโมเดล คืน (mode, models) หรือ (None, None) ถ้าทำไม่ได้ (เซ็ต base เอง)"""
     mode = _mode()
     if mode is None:
         base["status"] = "unavailable"
@@ -344,9 +342,7 @@ def analyze_video(url: str) -> dict:
                 "ยังไม่ได้ตั้งค่าตัวตรวจคลิป จึงตรวจคลิปไม่ได้ตอนนี้ "
                 "แต่ยังตรวจข้อความและถามผู้ช่วยได้ตามปกติ"
             )
-        return base
-
-    # เตรียมรายการโมเดลตามโหมด
+        return None, None
     if mode == "local":
         models = _load_models()
         base["models_used"] = [name for name, *_ in models]
@@ -356,79 +352,101 @@ def analyze_video(url: str) -> dict:
                 "โหลดตัวตรวจคลิปไม่สำเร็จ (อาจเป็นที่อินเทอร์เน็ต) ลองใหม่อีกครั้งภายหลัง "
                 "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
             )
-            return base
+            return None, None
     else:  # remote
         models = _init_remote_models()
         base["models_used"] = list(models)
+    return mode, models
 
+
+def _analyze_file(video_path: str, base: dict, mode: str, models) -> dict:
+    """ตัดเฟรม → ตรวจหน้า → ให้คะแนน → รวมผล (ใช้ร่วมกันทั้งลิงก์และไฟล์อัปโหลด)"""
+    # ตัดเฟรม
+    try:
+        frames = _extract_frames(video_path)
+    except Exception:
+        frames = []
+    if not frames:
+        base["error_th"] = "อ่านภาพจากคลิปนี้ไม่ได้ คลิปอาจเสียหรือเป็นรูปแบบที่ไม่รองรับ"
+        return base
+
+    # ตรวจหน้า + ให้คะแนนเฉพาะเฟรมที่เจอใบหน้า
+    per_frame = []  # (timestamp, score)
+    faces_found = 0
+    for ts, frame in frames:
+        face = _detect_face_crop(frame)
+        if face is None or face.size == 0:
+            continue
+        faces_found += 1
+        # โหมด remote จำกัดจำนวนหน้าที่ส่งไป API เพื่อความเร็ว/โควตา
+        if mode == "remote" and len(per_frame) >= REMOTE_MAX_FACES:
+            continue
+        try:
+            if mode == "local":
+                per_frame.append((ts, _score_face_local(face, models)))
+            else:
+                per_frame.append((ts, _score_face_remote(face, models)))
+        except Exception:
+            continue  # เฟรมนี้ประเมินพลาด — ข้าม (degrade นุ่มนวล)
+
+    base["frames_analyzed"] = len(frames)
+    base["faces_found"] = faces_found
+
+    # ไม่เจอใบหน้าเลยทั้งคลิป → ตอบตรง ๆ ไม่เดามั่ว
+    if faces_found == 0:
+        base["status"] = "no_face"
+        base["error_th"] = (
+            "ไม่พบใบหน้าคนในคลิปนี้ จึงประเมินไม่ได้ — "
+            "เครื่องมือนี้ตรวจได้เฉพาะคลิปที่เห็นใบหน้าชัด ๆ "
+            "ให้ใช้กฎทอง 3 ข้อช่วยตัดสินใจแทน"
+        )
+        return base
+
+    if not per_frame:
+        base["error_th"] = (
+            "พบใบหน้าในคลิปแต่ประเมินไม่สำเร็จ ลองใหม่อีกครั้งภายหลัง "
+            "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
+        )
+        return base
+
+    # รวมผลแบบค่าเฉลี่ย + timestamp ที่น่าสงสัย (คะแนน > 0.6)
+    avg = sum(s for _, s in per_frame) / len(per_frame)
+    base["status"] = "ok"
+    base["risk_percent"] = round(min(95.0, avg * 100), 1)
+    base["suspicious_timestamps"] = [round(ts, 1) for ts, s in per_frame if s > 0.6]
+    if mode == "remote":
+        base["models_used"] = list(models)  # เฉพาะตัวที่ยังไม่ตาย
+    return base
+
+
+def analyze_video(url: str) -> dict:
+    """วิเคราะห์วิดีโอจากลิงก์ (ดาวน์โหลดก่อน) — degrade อย่างนุ่มนวลเมื่อ error
+
+    คีย์: status, risk_percent, frames_analyzed, faces_found,
+          suspicious_timestamps, error_th, models_used, disclaimer_th
+    """
+    base = _new_base()
+    mode, models = _prepare(base)
+    if mode is None:
+        return base
     with tempfile.TemporaryDirectory(prefix="dfvideo_") as workdir:
-        # 1) ดาวน์โหลด
         try:
             video_path = _download_video(url, workdir)
         except Exception:
             base["error_th"] = (
-                "ดาวน์โหลดคลิปจากลิงก์นี้ไม่ได้ อาจเป็นเพราะแพลตฟอร์มบล็อกการโหลด "
-                "หรือคลิปเป็นส่วนตัว/ยาวเกิน 3 นาที — ลองใช้ลิงก์คลิปสาธารณะอื่น "
-                "หรือใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
+                "ดาวน์โหลดคลิปจากลิงก์นี้ไม่ได้ อาจเป็นเพราะแพลตฟอร์ม (เช่น TikTok/YouTube) "
+                "บล็อกการโหลดจากเซิร์ฟเวอร์ หรือคลิปเป็นส่วนตัว/ยาวเกิน 3 นาที — "
+                "ลองกด “อัปโหลดไฟล์คลิป” แทน (เซฟคลิปลงเครื่องก่อนแล้วเลือกไฟล์) "
+                "จะแน่นอนกว่า หรือใช้กฎทอง 3 ข้อช่วยสังเกต"
             )
             return base
+        return _analyze_file(video_path, base, mode, models)
 
-        # 2) ตัดเฟรม
-        try:
-            frames = _extract_frames(video_path)
-        except Exception:
-            frames = []
-        if not frames:
-            base["error_th"] = "อ่านภาพจากคลิปนี้ไม่ได้ คลิปอาจเสียหรือเป็นรูปแบบที่ไม่รองรับ"
-            return base
 
-        # 3) ตรวจหน้า + 4) ให้คะแนนเฉพาะเฟรมที่เจอใบหน้า
-        per_frame = []  # (timestamp, score)
-        faces_found = 0
-        for ts, frame in frames:
-            face = _detect_face_crop(frame)
-            if face is None or face.size == 0:
-                continue
-            faces_found += 1
-            # โหมด remote จำกัดจำนวนหน้าที่ส่งไป API เพื่อความเร็ว/โควตา
-            if mode == "remote" and len(per_frame) >= REMOTE_MAX_FACES:
-                continue
-            try:
-                if mode == "local":
-                    per_frame.append((ts, _score_face_local(face, models)))
-                else:
-                    per_frame.append((ts, _score_face_remote(face, models)))
-            except Exception:
-                continue  # เฟรมนี้ประเมินพลาด — ข้าม (degrade นุ่มนวล)
-
-        base["frames_analyzed"] = len(frames)
-        base["faces_found"] = faces_found
-
-        # ไม่เจอใบหน้าเลยทั้งคลิป → ตอบตรง ๆ ไม่เดามั่ว
-        if faces_found == 0:
-            base["status"] = "no_face"
-            base["error_th"] = (
-                "ไม่พบใบหน้าคนในคลิปนี้ จึงประเมินไม่ได้ — "
-                "เครื่องมือนี้ตรวจได้เฉพาะคลิปที่เห็นใบหน้าชัด ๆ "
-                "ให้ใช้กฎทอง 3 ข้อช่วยตัดสินใจแทน"
-            )
-            return base
-
-        if not per_frame:
-            base["error_th"] = (
-                "พบใบหน้าในคลิปแต่ประเมินไม่สำเร็จ ลองใหม่อีกครั้งภายหลัง "
-                "ระหว่างนี้ให้ใช้กฎทอง 3 ข้อช่วยสังเกตแทน"
-            )
-            return base
-
-        # 5) รวมผลแบบค่าเฉลี่ย + timestamp ที่น่าสงสัย (คะแนน > 0.6)
-        avg = sum(s for _, s in per_frame) / len(per_frame)
-        base["status"] = "ok"
-        base["risk_percent"] = round(min(95.0, avg * 100), 1)
-        base["suspicious_timestamps"] = [
-            round(ts, 1) for ts, s in per_frame if s > 0.6
-        ]
-        # โหมด remote: models_used = เฉพาะตัวที่ยังไม่ตาย
-        if mode == "remote":
-            base["models_used"] = list(models)
+def analyze_video_file(video_path: str) -> dict:
+    """วิเคราะห์วิดีโอจากไฟล์ที่อัปโหลดมา (ไม่ต้องดาวน์โหลด — เลี่ยงการบล็อกของแพลตฟอร์ม)"""
+    base = _new_base()
+    mode, models = _prepare(base)
+    if mode is None:
         return base
+    return _analyze_file(video_path, base, mode, models)
