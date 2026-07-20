@@ -33,6 +33,11 @@ FACE_MARGIN = float(os.environ.get("FACE_MARGIN", "0.2"))
 MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "16"))
 MAX_VIDEO_SECONDS = int(os.environ.get("MAX_VIDEO_SECONDS", "180"))
 
+# เกณฑ์ "สังเกตร่องรอยในภาพ" (อนุรักษ์นิยม — ค่านี้อ่อนไหวต่อความละเอียด/การบีบอัดมาก
+# จึงตั้งให้แจ้งเฉพาะเมื่อผิดปกติชัด ๆ เพื่อลด false alarm กับคลิปคนจริงที่ภาพไม่คม)
+ARTIFACT_SMOOTH_MAX = float(os.environ.get("ARTIFACT_SMOOTH_MAX", "0.020"))   # ต่ำกว่านี้ = เนียน/เบลอผิดธรรมชาติ
+ARTIFACT_SEAM_MIN = float(os.environ.get("ARTIFACT_SEAM_MIN", "3.5"))         # สูงกว่านี้ = ความคมไม่สม่ำเสมอ (อาจมีรอยต่อ)
+
 # โหมด remote (Hugging Face Inference API) — ตั้ง token ฝั่งเซิร์ฟเวอร์เท่านั้น
 HF_TOKEN = os.environ.get("DEEPFAKE_HF_TOKEN", "").strip()
 HF_ROUTER = "https://router.huggingface.co/hf-inference/models/"
@@ -320,10 +325,53 @@ def _new_base() -> dict:
         "frames_analyzed": 0,
         "faces_found": 0,
         "suspicious_timestamps": [],
+        "artifact_notes_th": [],   # จุดสังเกต "ร่องรอยในภาพ" ที่ตรวจเจอ (อาจว่าง)
         "error_th": None,
         "models_used": [],
         "disclaimer_th": DISCLAIMER_TH,
     }
+
+
+def _artifact_metrics(face_bgr):
+    """วัด "ร่องรอยในภาพ" จากใบหน้า 1 เฟรม (เทคนิคสังเกตด้วยตา แปลงเป็นตัวเลข)
+
+    คืน (hf_ratio, sharp_incons):
+    - hf_ratio    : สัดส่วนรายละเอียดความถี่สูง — ต่ำ = ผิวเนียน/เบลอผิดธรรมชาติ (ภาพที่คอมพิวเตอร์สร้าง)
+    - sharp_incons: ความไม่สม่ำเสมอของความคมระหว่างส่วนของใบหน้า — สูง = อาจมีรอยต่อการตัดต่อ
+    """
+    import cv2
+    import numpy as np
+    h, w = face_bgr.shape[:2]
+    if h < 40 or w < 40:
+        return None
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.5)
+    hf = float((gray - blur).var())
+    hf_ratio = hf / (float(gray.var()) + 1e-6)
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    ys, xs = [0, h // 2, h], [0, w // 2, w]
+    quads = [float(lap[ys[i]:ys[i + 1], xs[j]:xs[j + 1]].var()) for i in range(2) for j in range(2)]
+    sharp_incons = max(quads) / (min(quads) + 1e-6)
+    return hf_ratio, sharp_incons
+
+
+def _artifact_notes(metrics_list):
+    """สรุป "จุดสังเกตในภาพ" จากค่าที่วัดได้ทุกเฟรม (อนุรักษ์นิยม — แจ้งเฉพาะที่ผิดปกติชัด)
+
+    คืน (notes_th, strong) โดย strong=True เมื่อเจอร่องรอยเด่นพอจะใช้ยืนยันผลโมเดล
+    """
+    import statistics
+    vals = [m for m in metrics_list if m]
+    if not vals:
+        return [], False
+    med_smooth = statistics.median([v[0] for v in vals])
+    max_seam = max(v[1] for v in vals)
+    notes = []
+    if med_smooth < ARTIFACT_SMOOTH_MAX:
+        notes.append("ผิวใบหน้าดูเนียนหรือเบลอกว่าธรรมชาติ — ภาพที่คอมพิวเตอร์สร้างมักผิวเรียบผิดปกติ ลองซูมดูรูขุมขน/เส้นผมว่าคมชัดสมจริงไหม")
+    if max_seam > ARTIFACT_SEAM_MIN:
+        notes.append("ความคมชัดในใบหน้าไม่สม่ำเสมอ อาจมีรอยต่อของการตัดต่อ ลองเพ่งดูขอบใบหน้า ไรผม และใต้คาง")
+    return notes, bool(notes)
 
 
 def _prepare(base: dict):
@@ -371,7 +419,8 @@ def _analyze_file(video_path: str, base: dict, mode: str, models) -> dict:
         return base
 
     # ตรวจหน้า + ให้คะแนนเฉพาะเฟรมที่เจอใบหน้า
-    per_frame = []  # (timestamp, score)
+    per_frame = []       # (timestamp, score) จากโมเดล
+    artifact_vals = []   # ค่าร่องรอยในภาพต่อเฟรม (เทคนิคสังเกตด้วยตา)
     faces_found = 0
     for ts, frame in frames:
         face = _detect_face_crop(frame)
@@ -381,6 +430,10 @@ def _analyze_file(video_path: str, base: dict, mode: str, models) -> dict:
         # โหมด remote จำกัดจำนวนหน้าที่ส่งไป API เพื่อความเร็ว/โควตา
         if mode == "remote" and len(per_frame) >= REMOTE_MAX_FACES:
             continue
+        try:
+            artifact_vals.append(_artifact_metrics(face))  # เร็ว ทำในเครื่อง
+        except Exception:
+            pass
         try:
             if mode == "local":
                 per_frame.append((ts, _score_face_local(face, models)))
@@ -411,8 +464,17 @@ def _analyze_file(video_path: str, base: dict, mode: str, models) -> dict:
 
     # รวมผลแบบค่าเฉลี่ย + timestamp ที่น่าสงสัย (คะแนน > 0.6)
     avg = sum(s for _, s in per_frame) / len(per_frame)
+    risk = avg * 100
+
+    # "สังเกตร่องรอยในภาพ" — สัญญาณเสริมเชิงยืนยัน (ไม่สร้างความเสี่ยงขึ้นเอง)
+    # ใช้ยืนยันเมื่อโมเดลสงสัยอยู่แล้วเท่านั้น เพื่อกัน false alarm กับคลิปคนจริงที่ภาพไม่คม
+    notes, strong = _artifact_notes(artifact_vals)
+    base["artifact_notes_th"] = notes
+    if strong and avg >= 0.45:
+        risk = min(95.0, risk + 5)  # ร่องรอยชัด + โมเดลสงสัย → ดันขึ้นเล็กน้อย
+
     base["status"] = "ok"
-    base["risk_percent"] = round(min(95.0, avg * 100), 1)
+    base["risk_percent"] = round(min(95.0, risk), 1)
     base["suspicious_timestamps"] = [round(ts, 1) for ts, s in per_frame if s > 0.6]
     if mode == "remote":
         base["models_used"] = list(models)  # เฉพาะตัวที่ยังไม่ตาย

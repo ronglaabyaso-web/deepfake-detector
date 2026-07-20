@@ -684,6 +684,16 @@ registerPage("check", (root) => {
         }).join(", ");
         extras.push(el("p", { class: "muted", style: "margin-top:6px", text: `ช่วงเวลาที่น่าสงสัย (นาที:วินาที): ${times}` }));
       }
+      // จุดสังเกต "ร่องรอยในภาพ" ที่ระบบตรวจเจอ (ถ้ามี)
+      if (d.artifact_notes_th && d.artifact_notes_th.length) {
+        extras.push(el("h3", { style: "margin-top:14px", text: "🔬 ร่องรอยในภาพที่พบ" }));
+        for (const n of d.artifact_notes_th) {
+          extras.push(el("div", { class: "signal" }, el("span", { class: "dot", text: "•" }), el("span", { text: n })));
+        }
+      }
+      // เช็กลิสต์ให้ผู้ใช้เพ่งดูเอง (หลักการ "สังเกตร่องรอยด้วยตา")
+      extras.push(el("div", { class: "acc-warn", style: "margin-top:14px" },
+        "👀 ลองเพ่งดูคลิปเต็ม ๆ ด้วยตาตัวเองด้วยนะคะ: ขอบใบหน้า/ไรผมเบลอหรือมีรอยต่อไหม, ดวงตากะพริบธรรมชาติไหม, ฟันและหูผิดรูปไหม, แสงบนหน้าเข้ากับฉากหลังไหม, ปากขยับตรงกับเสียงไหม"));
       renderRisk(videoResult, d.risk_percent, null,
         d.risk_percent >= 60 ? "คลิปนี้มีสัญญาณของการปลอมแปลงค่อนข้างมาก" :
         d.risk_percent >= 30 ? "คลิปนี้มีบางจุดน่าสงสัย ควรตรวจสอบเพิ่ม" :
@@ -812,6 +822,28 @@ registerPage("learn", (root) => {
   rulesBox.appendChild(spinnerBox("กำลังโหลด..."));
   root.appendChild(rulesBox);
   loadGoldenRules(rulesBox);
+
+  /* จับคลิปปลอมด้วยตาเปล่า — จุดสังเกตร่องรอยในภาพ */
+  root.appendChild(el("h2", { text: "จับคลิปปลอมด้วยตาเปล่า" }));
+  const eyeChecks = [
+    ["🫧", "ผิวหน้าเนียนหรือเบลอผิดปกติ", "ภาพที่คอมพิวเตอร์สร้างมักผิวเรียบเกินจริง ไม่มีรูขุมขน/ริ้วรอย ลองซูมดูใกล้ ๆ"],
+    ["✂️", "ขอบใบหน้าและไรผมมีรอยต่อ", "รอยต่อระหว่างหน้ากับผม คอ หรือฉากหลัง อาจเบลอ สั่น หรือความคมไม่เท่ากัน"],
+    ["👁️", "ดวงตาและการกะพริบผิดธรรมชาติ", "กะพริบถี่/ห่างผิดปกติ ตาไม่โฟกัส หรือแสงสะท้อนในตาสองข้างไม่ตรงกัน"],
+    ["🦷", "ฟัน หู หรือแว่นผิดรูป", "ฟันเบลอเป็นก้อน หูบิดเบี้ยว ต่างหู/แว่นวูบหายหรือเปลี่ยนรูปเวลาขยับหัว"],
+    ["💡", "แสงและเงาไม่เข้ากับฉาก", "แสงบนใบหน้าทิศทางไม่ตรงกับสภาพแวดล้อม หรือสีผิวเพี้ยนจากคอ/มือ"],
+    ["👄", "ปากขยับไม่ตรงกับเสียง", "ริมฝีปากกับคำพูดไม่ตรงกัน หรือขยับแข็ง ๆ เหมือนหุ่น"],
+  ];
+  const eyeBox = el("div", null);
+  for (const [ic, title, detail] of eyeChecks) {
+    eyeBox.appendChild(el("div", { class: "acc-item" },
+      el("div", { class: "acc-head", style: "cursor:default" },
+        el("span", { class: "acc-ic", text: ic }), el("span", { text: title })),
+      el("div", { class: "acc-body", style: "display:block" },
+        el("p", { class: "muted", text: detail }))));
+  }
+  root.appendChild(eyeBox);
+  root.appendChild(el("div", { class: "acc-warn", style: "margin-bottom:6px" },
+    "⚠️ วิธีสังเกตด้วยตานี้ช่วยได้ระดับหนึ่ง แต่คลิปปลอมสมัยใหม่ทำได้เนียนขึ้นเรื่อย ๆ จนตาคนแยกไม่ออก — อย่าใช้ตัดสินอย่างเดียว ให้ยึดกฎทอง 3 ข้อ (ไม่โอนเงิน วางสายโทรกลับเบอร์จริง) เป็นหลักเสมอ"));
 
   /* รูปแบบมิจฉาชีพ (accordion) */
   root.appendChild(el("h2", { text: "9 กลโกงที่ต้องรู้จัก" }));
